@@ -89,11 +89,14 @@ func (p *Probe) Initialize(ctx context.Context, cfg domain.Configuration) error 
 	}
 	p.config = gotlsConfig
 
+	perfReorder, perfReorderLagNs := gotlsConfig.GetPerfReorder()
 	p.Logger().Info().
 		Str("go_version", gotlsConfig.GoVersion).
 		Bool("is_register_abi", gotlsConfig.IsRegisterABI).
 		Str("capture_mode", gotlsConfig.CaptureMode).
 		Str("elf_path", gotlsConfig.ElfPath).
+		Bool("perf_reorder", perfReorder).
+		Uint64("perf_reorder_lag_ns", perfReorderLagNs).
 		Msg("GoTLS probe initialized")
 
 	return nil
@@ -324,12 +327,24 @@ func (p *Probe) getManagerOptions() manager.Options {
 			{Name: "less52", Value: kernelLess52},
 			{Name: "target_cgroup_id", Value: cgroupId},
 		}
+	} else {
+		// Kernel < 5.2 does not support .rodata global variables, so PID/UID/cgroup filters cannot be applied.
+		if p.config.GetPid() != 0 {
+			p.Logger().Warn().Uint64("pid", p.config.GetPid()).
+				Msg("PID filter is not supported on kernel < 5.2, --pid filter will be ignored")
+		}
+		if p.config.GetUid() != 0 {
+			p.Logger().Warn().Uint64("uid", p.config.GetUid()).
+				Msg("UID filter is not supported on kernel < 5.2, --uid filter will be ignored")
+		}
+		if p.config.GetCGroupPath() != "" {
+			p.Logger().Warn().Str("cgroupPath", p.config.GetCGroupPath()).
+				Msg("cgroup_path filter is not supported on kernel < 5.2, --cgroup_path filter will be ignored")
+		}
 	}
 
 	return opts
 }
-
-// setupManagersKeyLog configures the eBPF manager for keylog mode (GoTLS data capture)
 func (p *Probe) setupManagersKeyLog(keySection, keyFunc string) error {
 	var gotlsConf = p.config
 
@@ -554,7 +569,6 @@ type tlsDataEventDecoder struct {
 
 func (d *tlsDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
 	event := &GoTLSDataEvent{}
-	fmt.Println("Decoding TLSDataEvent from bytes, data length:", len(data))
 	if err := event.DecodeFromBytes(data); err != nil {
 		return nil, err
 	}

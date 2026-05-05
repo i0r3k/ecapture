@@ -18,6 +18,8 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"io"
+	"sync"
 	"sync/atomic"
 
 	"github.com/cilium/ebpf"
@@ -42,14 +44,15 @@ const (
 // BaseProbe provides common functionality for all probes.
 // Concrete probes should embed this struct and implement probe-specific logic.
 type BaseProbe struct {
-	name       string
-	logger     *logger.Logger
-	ctx        context.Context
-	config     domain.Configuration
-	dispatcher domain.EventDispatcher
-	isRunning  atomic.Bool
-	readers    []closer
-	closers    []closer
+	name         string
+	logger       *logger.Logger
+	ctx          context.Context
+	config       domain.Configuration
+	dispatcher   domain.EventDispatcher
+	isRunning    atomic.Bool
+	readers      []io.Closer
+	closers      []closer
+	readerLoopsW sync.WaitGroup // perf/ringbuf read goroutines; see GoReaderLoop
 }
 
 // closer interface for resources that need to be closed.
@@ -61,7 +64,7 @@ type closer interface {
 func NewBaseProbe(name string) *BaseProbe {
 	return &BaseProbe{
 		name:    name,
-		readers: make([]closer, 0),
+		readers: make([]io.Closer, 0),
 		closers: make([]closer, 0),
 	}
 }
@@ -184,6 +187,10 @@ func (p *BaseProbe) Close() error {
 
 	p.readers = nil
 
+	// Reader Close() unblocks rd.Read(); read loops may still run deferred work
+	// (e.g. userland perf reorder flush) that calls Dispatch. Wait before closing dispatcher.
+	p.readerLoopsW.Wait()
+
 	for _, cler := range p.closers {
 		if err := cler.Close(); err != nil {
 			if p.logger != nil {
@@ -238,6 +245,14 @@ func (p *BaseProbe) Dispatcher() domain.EventDispatcher {
 	return p.dispatcher
 }
 
+// TrackPerfReader registers a perf/ringbuf reader to be closed in Close().
+func (p *BaseProbe) TrackPerfReader(c io.Closer) {
+	if c == nil {
+		return
+	}
+	p.readers = append(p.readers, c)
+}
+
 func (p *BaseProbe) SetDispatcher(dispatcher domain.EventDispatcher) {
 	p.dispatcher = dispatcher
 }
@@ -262,15 +277,66 @@ func (p *BaseProbe) StartPerfEventReader(em *ebpf.Map, decoder domain.EventDecod
 		return errors.NewEBPFAttachError(em.String(), err)
 	}
 
-	p.readers = append(p.readers, rd)
+	p.TrackReader(rd)
+
+	reorderRequested, lagNs := p.config.GetPerfReorder()
+	reorderEnabled := reorderRequested && p.decoderSupportsPerfReorder(em, decoder)
+	if reorderEnabled {
+		p.logger.Info().
+			Str("map", em.String()).
+			Int("size_mb", mapSize/1024/1024).
+			Bool("perf_reorder", true).
+			Uint64("perf_reorder_lag_ns", lagNs).
+			Msg("Perf event reader started")
+		p.GoReaderLoop(func() { p.perfEventLoopOrdered(rd, em, decoder, lagNs) })
+		return nil
+	}
 
 	p.logger.Info().
 		Str("map", em.String()).
 		Int("size_mb", mapSize/1024/1024).
+		Bool("perf_reorder", false).
 		Msg("Perf event reader started")
-
-	go p.perfEventLoop(rd, em, decoder)
+	if reorderRequested {
+		p.logger.Debug().
+			Str("map", em.String()).
+			Msg("perf_reorder ignored: event decoder has no bpf monotonic timestamp")
+	}
+	p.GoReaderLoop(func() { p.perfEventLoop(rd, em, decoder) })
 	return nil
+}
+
+func (p *BaseProbe) decoderSupportsPerfReorder(em *ebpf.Map, decoder domain.EventDecoder) bool {
+	ev, ok := decoder.GetDecoder(em)
+	if !ok {
+		return false
+	}
+	if _, ok := domain.AsMonoNsEvent(ev); !ok {
+		return false
+	}
+	return true
+}
+
+// GoReaderLoop runs fn in a goroutine tracked for shutdown ordering: Close() closes
+// perf/ringbuf readers first, waits for all GoReaderLoop goroutines to exit, then
+// closes the dispatcher. Probes must use this for read loops that may Dispatch after
+// Read returns (e.g. deferred flush).
+func (p *BaseProbe) GoReaderLoop(fn func()) {
+	p.readerLoopsW.Add(1)
+	go func() {
+		defer p.readerLoopsW.Done()
+		fn()
+	}()
+}
+
+// TrackReader registers a reader to be closed when the probe shuts down.
+// Probes that implement a custom perf read loop should call TrackReader with the same reader
+// instance they pass to the goroutine, matching StartPerfEventReader lifecycle.
+func (p *BaseProbe) TrackReader(c io.Closer) {
+	if c == nil {
+		return
+	}
+	p.readers = append(p.readers, c)
 }
 
 // perfEventLoop reads events from a perf buffer.
@@ -310,8 +376,82 @@ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.
 		}
 		p.logger.Debug().Str("event", event.String()).Msg("Perf event decoded")
 
+		if mn, ok := domain.AsMonoNsEvent(event); ok {
+			p.logPerfDispatchDebug("no reorder", mn)
+		}
 		if err := p.dispatcher.Dispatch(event); err != nil {
 			p.logger.Warn().Err(err).Msg("Failed to dispatch event")
+		}
+	}
+}
+
+func (p *BaseProbe) logPerfDispatchDebug(phase string, mn domain.MonoNsEvent) {
+	// Substrings "no reorder" / "after reorder" are relied on by external log verification tools.
+	p.logger.Debug().Msgf("%s perf dispatch (%s) mono_ns=%d", p.name, phase, mn.PerfMonoNs())
+}
+
+func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder domain.EventDecoder, lagNs uint64) {
+	reorder := newPerfLagReorder(lagNs)
+	defer func() {
+		for _, ev := range reorder.flushAll() {
+			if mn, ok := domain.AsMonoNsEvent(ev); ok {
+				p.logPerfDispatchDebug("after reorder", mn)
+			}
+			if err := p.dispatcher.Dispatch(ev); err != nil {
+				p.logger.Warn().Err(err).Msg("Failed to dispatch reordered event")
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			p.logger.Debug().Msg("Perf event reader stopping")
+			return
+		default:
+		}
+
+		record, err := rd.Read()
+		if err != nil {
+			if stderrors.Is(err, perf.ErrClosed) {
+				return
+			}
+			p.logger.Warn().Err(err).Msg("Error reading from perf buffer")
+			continue
+		}
+
+		if record.LostSamples != 0 {
+			p.logger.Warn().
+				Uint64("lost_samples", record.LostSamples).
+				Msg("Perf buffer full, samples lost")
+			continue
+		}
+		event, err := decoder.Decode(em, record.RawSample)
+		if err != nil {
+			if stderrors.Is(err, errors.ErrEventNotReady) {
+				p.logger.Debug().Msg("Event not ready, skipping")
+				continue
+			}
+			p.logger.Warn().Err(err).Msg("Failed to decode event")
+			continue
+		}
+		p.logger.Debug().Str("event", event.String()).Msg("Perf event decoded")
+
+		mn, ok := domain.AsMonoNsEvent(event)
+		if !ok {
+			if err := p.dispatcher.Dispatch(event); err != nil {
+				p.logger.Warn().Err(err).Msg("Failed to dispatch event")
+			}
+			continue
+		}
+
+		for _, ev := range reorder.push(mn) {
+			if out, ok2 := domain.AsMonoNsEvent(ev); ok2 {
+				p.logPerfDispatchDebug("after reorder", out)
+			}
+			if err := p.dispatcher.Dispatch(ev); err != nil {
+				p.logger.Warn().Err(err).Msg("Failed to dispatch reordered event")
+			}
 		}
 	}
 }
@@ -336,7 +476,7 @@ func (p *BaseProbe) StartRingbufReader(em *ebpf.Map, decoder domain.EventDecoder
 		Str("map", em.String()).
 		Msg("Ringbuf reader started")
 
-	go p.ringbufEventLoop(rd, em, decoder)
+	p.GoReaderLoop(func() { p.ringbufEventLoop(rd, em, decoder) })
 	return nil
 }
 
